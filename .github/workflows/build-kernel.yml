@@ -1,14 +1,15 @@
-name: build-kernel
+name: Build Kernel (No SU)
 on:
   workflow_dispatch:
+
 env:
   CLANG_DIR: clang-r584948
+
 jobs:
-  build-ksu:
+  build-kernel-nosu:
     runs-on: ubuntu-22.04
     steps:
       - name: Free Disk Space (Ubuntu)
-        if: ${{ true }} # Set to true if space insufficient
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -18,78 +19,58 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: false
+
       - name: Set Swap Space
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 16
-      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v4
         with:
           path: aospa-gki-kernel-build
+
       - name: Setup Python
         uses: actions/setup-python@v5 
         with:
           python-version: 'pypy3.10'
+
       - name: Setup build environment
         run: |
           sudo apt-get update
           sudo apt-get install -y bc device-tree-compiler
           sudo curl --create-dirs -o /usr/local/bin/repo -L https://storage.googleapis.com/git-repo-downloads/repo
           sudo chmod a+rx /usr/local/bin/repo
+
       - name: Clone repo and sync
         run: |
           repo init -u https://github.com/bryanyee33/aospa-gki-kernel-build -b "$(git -C aospa-gki-kernel-build branch --show-current)" -m manifest.xml --depth=1
           repo sync
           mkdir -p kernel_platform/device/xiaomi/marble-kernel/dtbs
+
       - name: Setup clang
         run: |
           mkdir -p kernel_platform/clang
           cd kernel_platform/clang
-
-          : # git clone --filter & git sparse-checkout to only download required directory
           git clone -n --depth=1 --filter=tree:0 -b main-kernel --single-branch \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 .
           git sparse-checkout set --no-cone "/$CLANG_DIR"
           git checkout
-      - name: Include KSU
-        run: |
-          cd kernel_platform/xiaomi/sm8450
-          rmdir KernelSU
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-      - name: Include SUSFS
-        run: |
-          HOME="$(pwd)"
-          cp -r susfs4ksu/kernel_patches/* kernel_platform/xiaomi/sm8450
-          cd kernel_platform/xiaomi/sm8450/KernelSU
-          patch -p1 < 10_enable_susfs_for_ksu.patch
-          cd ..
 
-          : # Fix sus mount not triggering after boot completed
-          sed -i 's/if (susfs_is_boot_completed_triggered)/if (false)/g' 50_add_susfs_in_gki-android12-5.10.patch
-          patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
-          cd $HOME/susfs4ksu
-          ./build_ksu_module.sh
-          mv ksu_module_susfs.zip ..
-      - name: Include other KSU manager signatures
-        run: |
-          sed -i '/return (check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH) ||/a\
-              check_v2_signature(path, 0x363, "4359c171f32543394cbc23ef908c4bb94cad7c8087002ba164c8230948c21549") /*backslashxx*/ || \
-              check_v2_signature(path, 0x3e6, "79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7") /*KernelSU-Next*/ || \
-              \' kernel_platform/xiaomi/sm8450/KernelSU/kernel/apk_sign.c
-      - name: Include personal changes
+      - name: Include personal changes & Fixes
         run: |
           cp -rf aospa-gki-kernel-build/android_kernel_xiaomi_sm8450/. kernel_platform/xiaomi/sm8450
           cd kernel_platform/xiaomi/sm8450
 
-          : # Fix clang 19 warnings
           curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply
           curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply
 
-          : # Fix clang 21 warnings
           curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply
           cd ..
+          
           curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang.patch
           sed -i 's/drivers\/staging/sm8450-modules\/qcom\/opensource\/wlan/g' clang.patch
           patch -p1 < clang.patch
+          
           curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/3e043c16430a95f6d328f5396c14ec18a52ab10a.patch > clang.patch
           sed -i 's/drivers/sm8450\/drivers/g' clang.patch
           sed -i 's/techpack\/display/sm8450-modules\/qcom\/opensource\/display-drivers/g' clang.patch
@@ -99,6 +80,7 @@ jobs:
         run: |
           cd kernel_platform/xiaomi/sm8450
           ./build.sh marble
+
       - name: Zip output
         run: |
           git clone --depth=1 -b marble https://github.com/bryanyee33/AnyKernel3.git AnyKernel3-marble
@@ -120,27 +102,25 @@ jobs:
           rm -r .git README.md
           find . -type f -name 'placeholder' -delete
           find . -type d -empty -delete
+
       - name: Generate release tag
         id: tag
-        run: echo "release_tag=AOSPA_KSU_GKI_$(date +'%Y.%m.%d')" >> "$GITHUB_OUTPUT"
+        run: echo "release_tag=AOSPA_Stock_GKI_$(date +'%Y.%m.%d')" >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           files: |
             marble-kernel.zip
-      - name: Upload ksu_module_susfs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ksu_module_susfs
-          path: susfs4ksu/ksu_module_susfs/*
-          compression-level: 9
+
       - name: Upload marble-kernel artifact
         uses: actions/upload-artifact@v4
         with:
           name: marble-kernel
           path: AnyKernel3-marble/*
           compression-level: 9
+
       - name: Upload blobs artifact
         uses: actions/upload-artifact@v4
         with:
