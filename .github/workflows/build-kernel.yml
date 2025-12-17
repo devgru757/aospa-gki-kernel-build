@@ -1,9 +1,13 @@
 name: Build Kernel (No SU)
+
 on:
   workflow_dispatch:
 
 env:
   CLANG_DIR: clang-r584948
+
+permissions:
+  contents: write
 
 jobs:
   build-kernel-nosu:
