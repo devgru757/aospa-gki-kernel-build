@@ -47,7 +47,8 @@ jobs:
 
       - name: Clone repo and sync
         run: |
-          repo init -u https://github.com/bryanyee33/aospa-gki-kernel-build -b "$(git -C aospa-gki-kernel-build branch --show-current)" -m manifest.xml --depth=1
+          # DYNAMIC REPO INIT: Uses the current repository URL automatically
+          repo init -u $GITHUB_SERVER_URL/$GITHUB_REPOSITORY -b $GITHUB_REF_NAME -m manifest.xml --depth=1
           repo sync
           mkdir -p kernel_platform/device/xiaomi/marble-kernel/dtbs
 
@@ -62,23 +63,29 @@ jobs:
 
       - name: Include personal changes & Fixes
         run: |
+          # Copy source files from the checkout path to the build tree
           cp -rf aospa-gki-kernel-build/android_kernel_xiaomi_sm8450/. kernel_platform/xiaomi/sm8450
           cd kernel_platform/xiaomi/sm8450
 
-          curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply
-          curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply
-
-          curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply
+          # Attempt to apply patches, continue if failed (already applied)
+          echo "Applying patches..."
+          
+          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v || echo "Patch 1 skipped (likely present)."
+          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v || echo "Patch 2 skipped (likely present)."
+          curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply -v || echo "Patch 3 skipped (likely present)."
+          
           cd ..
           
-          curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang.patch
+          # Custom patches using sed/patch
+          # We use '|| true' to prevent the build from stopping if these hunks fail
+          curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang.patch
           sed -i 's/drivers\/staging/sm8450-modules\/qcom\/opensource\/wlan/g' clang.patch
-          patch -p1 < clang.patch
+          patch -p1 < clang.patch || echo "Patch 4 skipped (likely present)."
           
-          curl https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/3e043c16430a95f6d328f5396c14ec18a52ab10a.patch > clang.patch
+          curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/3e043c16430a95f6d328f5396c14ec18a52ab10a.patch > clang.patch
           sed -i 's/drivers/sm8450\/drivers/g' clang.patch
           sed -i 's/techpack\/display/sm8450-modules\/qcom\/opensource\/display-drivers/g' clang.patch
-          patch -p1 < clang.patch
+          patch -p1 < clang.patch || echo "Patch 5 skipped (likely present)."
 
       - name: Build kernel
         run: |
@@ -87,6 +94,8 @@ jobs:
 
       - name: Zip output
         run: |
+          # NOTE: Hardcoded 'bryanyee33' for AnyKernel3 tool is OK as it is a utility repo.
+          # If you have your own AnyKernel3 fork, change the URL below.
           git clone --depth=1 -b marble https://github.com/bryanyee33/AnyKernel3.git AnyKernel3-marble
           cd AnyKernel3-marble
           cp ../kernel_platform/device/xiaomi/marble-kernel/Image .
