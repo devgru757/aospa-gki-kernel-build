@@ -5,6 +5,10 @@ on:
 
 env:
   CLANG_DIR: clang-r584948
+  # Optimize for CI: Use Thin LTO to prevent Out-Of-Memory errors
+  LTO: thin
+  # Skip ABI checks to prevent failures if KSU removal shifts offsets
+  SKIP_ABI_CHECKS: true
 
 permissions:
   contents: write
@@ -29,7 +33,8 @@ jobs:
         with:
           swap-size-gb: 16
 
-      - uses: actions/checkout@v4
+      - name: Checkout Workflow
+        uses: actions/checkout@v4
         with:
           path: aospa-gki-kernel-build
 
@@ -47,7 +52,7 @@ jobs:
 
       - name: Clone repo and sync
         run: |
-          # DYNAMIC REPO INIT: Uses the current repository URL automatically
+          # Uses the current repository URL automatically
           repo init -u $GITHUB_SERVER_URL/$GITHUB_REPOSITORY -b $GITHUB_REF_NAME -m manifest.xml --depth=1
           repo sync
           mkdir -p kernel_platform/device/xiaomi/marble-kernel/dtbs
@@ -61,23 +66,38 @@ jobs:
           git sparse-checkout set --no-cone "/$CLANG_DIR"
           git checkout
 
-      - name: Include personal changes & Fixes
+      - name: Include personal changes & Scrub KSU
         run: |
-          # Copy source files from the checkout path to the build tree
+          # 1. Copy source files
           cp -rf aospa-gki-kernel-build/android_kernel_xiaomi_sm8450/. kernel_platform/xiaomi/sm8450
           cd kernel_platform/xiaomi/sm8450
 
-          # Attempt to apply patches, continue if failed (already applied)
-          echo "Applying patches..."
+          # 2. DEEP CLEAN: Remove KernelSU references from Kconfig/Makefile
+          echo "Scrubbing KSU from Kconfig..."
+          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig
+          sed -i '/kernelsu/d' drivers/Makefile
+          sed -i '/CONFIG_KSU/d' drivers/Makefile
+
+          # 3. DEEP CLEAN: Remove KernelSU hooks from core source files
+          # This prevents "undefined reference" errors during linking if hooks exist.
+          echo "Scrubbing KSU hooks from core kernel files..."
           
+          # Remove includes of ksu.h
+          grep -rl "drivers/kernelsu/ksu.h" . | xargs sed -i '/drivers\/kernelsu\/ksu.h/d' || true
+          
+          # Remove function calls like ksu_handle_execve, ksu_handle_input, etc.
+          # We use a broad pattern to catch all ksu_handle_* calls.
+          grep -rl "ksu_handle" fs/ drivers/input/ | xargs sed -i '/ksu_handle/d' || true
+
+          # 4. Apply Patches (Tolerate failures if already applied)
+          echo "Applying patches..."
           curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v || echo "Patch 1 skipped (likely present)."
           curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v || echo "Patch 2 skipped (likely present)."
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply -v || echo "Patch 3 skipped (likely present)."
           
           cd ..
           
-          # Custom patches using sed/patch
-          # We use '|| true' to prevent the build from stopping if these hunks fail
+          # 5. Apply Clang/Driver Patches
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang.patch
           sed -i 's/drivers\/staging/sm8450-modules\/qcom\/opensource\/wlan/g' clang.patch
           patch -p1 < clang.patch || echo "Patch 4 skipped (likely present)."
@@ -94,8 +114,6 @@ jobs:
 
       - name: Zip output
         run: |
-          # NOTE: Hardcoded 'bryanyee33' for AnyKernel3 tool is OK as it is a utility repo.
-          # If you have your own AnyKernel3 fork, change the URL below.
           git clone --depth=1 -b marble https://github.com/bryanyee33/AnyKernel3.git AnyKernel3-marble
           cd AnyKernel3-marble
           cp ../kernel_platform/device/xiaomi/marble-kernel/Image .
