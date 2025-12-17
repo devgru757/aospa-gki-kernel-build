@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
 
 env:
+  # Build Configs
   CLANG_DIR: clang-r584948
   LTO: thin
   SKIP_ABI_CHECKS: true
+  
+  # Repo Settings
+  MANIFEST_URL: https://github.com/devgru757/aospa-gki-kernel-build
+  MANIFEST_BRANCH: main
 
 permissions:
   contents: write
@@ -31,111 +36,128 @@ jobs:
         with:
           swap-size-gb: 16
 
-      - name: Setup Build Structure
-        run: |
-          # We align the structure to match build.sh requirements:
-          # workspace/device/xiaomi/marble-kernel (Script runs here)
-          # workspace/device/clang                (KP_ROOT/clang)
-          # workspace/device/prebuilts            (KP_ROOT/prebuilts)
-          
-          mkdir -p workspace/device/xiaomi
-          mkdir -p workspace/device/clang
-          mkdir -p workspace/device/prebuilts/kernel-build-tools
-
-      - name: Setup Python
-        uses: actions/setup-python@v5 
-        with:
-          python-version: '3.10'
-
-      - name: Install Build Tools
+      - name: Setup Build Environment
         run: |
           sudo apt-get update
           sudo apt-get install -y bc device-tree-compiler bison flex libssl-dev git zip
-          sudo curl --create-dirs -o /usr/local/bin/repo -L https://storage.googleapis.com/git-repo-downloads/repo
-          sudo chmod a+rx /usr/local/bin/repo
-
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-        with:
-          path: temp_source
-
-      - name: Organize Source Code
-        run: |
-          # Move repo to workspace/device/xiaomi/marble-kernel
-          mv temp_source/android_kernel_xiaomi_sm8450 workspace/device/xiaomi/marble-kernel
-          rm -rf temp_source
-
-      - name: Clone Dependencies
-        run: |
-          cd workspace/device/xiaomi
-          # Clone modules and devicetrees as siblings to marble-kernel
-          git clone --depth=1 https://github.com/LineageOS/android_kernel_xiaomi_sm8450-modules sm8450-modules
-          git clone --depth=1 https://github.com/LineageOS/android_kernel_xiaomi_sm8450-devicetrees sm8450-devicetrees
           
-          # Clone prebuilts into workspace/device/prebuilts (Fixes KP_ROOT issue)
-          cd ../prebuilts
-          git clone --depth=1 https://android.googlesource.com/kernel/prebuilts/build-tools kernel-build-tools
+          # Install Repo Tool
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+          
+          # Configure Git (Required for Repo)
+          git config --global user.name "CI Builder"
+          git config --global user.email "ci@localhost"
 
-      - name: Setup Clang
+      - name: Initialize & Sync Kernel Source
         run: |
-          # Clone Clang into workspace/device/clang (Fixes KP_ROOT issue)
-          cd workspace/device/clang
-          git clone -n --depth=1 --filter=tree:0 -b main-kernel --single-branch \
-              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 .
-          git sparse-checkout set --no-cone "/$CLANG_DIR"
-          git checkout
+          mkdir -p workspace
+          cd workspace
+          
+          # 1. Initialize using the Builder Repo's manifest
+          # This tells 'repo' where to find the REAL kernel source (Lineage/AOSPA)
+          repo init -u $MANIFEST_URL -b $MANIFEST_BRANCH -m manifest.xml --depth=1
+          
+          # 2. Sync the source (This downloads the actual kernel ~2-5GB)
+          # We use -j$(nproc) to download faster
+          repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags
 
-      - name: Configure Build Environment
+      - name: Apply Overlays (Builder Repo)
+        run: |
+          # The 'repo sync' fetched the Stock Kernel. 
+          # Now we manually clone the Builder Repo to get the 'personal changes' and 'build.sh'.
+          
+          git clone --depth=1 -b $MANIFEST_BRANCH $MANIFEST_URL builder_overlay
+          
+          # Copy the overlay files INTO the synced kernel source
+          # build.sh expects the kernel at: device/xiaomi/marble-kernel
+          cp -rf builder_overlay/android_kernel_xiaomi_sm8450/* workspace/device/xiaomi/marble-kernel/
+          
+          # Clean up
+          rm -rf builder_overlay
+
+      - name: Setup Clang (Manual)
+        # Only needed if manifest didn't sync it. Usually manifests include clang.
+        # We check if clang exists, if not we clone it.
+        run: |
+          if [ ! -d "workspace/clang/$CLANG_DIR" ]; then
+            echo "Clang not found in manifest, cloning manually..."
+            mkdir -p workspace/clang
+            cd workspace/clang
+            git clone -n --depth=1 --filter=tree:0 -b main-kernel --single-branch \
+                https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 .
+            git sparse-checkout set --no-cone "/$CLANG_DIR"
+            git checkout
+          fi
+
+      - name: Setup Build Configuration
         run: |
           cd workspace/device/xiaomi/marble-kernel
           
-          # Create .build.rc file so build.sh knows where the root is
-          echo "SRC_ROOT=$GITHUB_WORKSPACE/workspace" > .build.rc
+          # Generate .build.rc for build.sh
+          # SRC_ROOT must point to the workspace root (../../ relative to kernel)
+          echo "SRC_ROOT=$(realpath ../..)" > .build.rc
 
       - name: Deep Clean (Remove SU & SUSFS)
         run: |
           cd workspace/device/xiaomi/marble-kernel
 
-          # 1. REMOVE PERSONAL.CONFIG from build.sh merge list
+          # 1. REMOVE PERSONAL.CONFIG from build.sh
+          # The builder repo enables KSU in 'personal.config'. We must prevent this file from being used.
           sed -i 's/vendor\/personal.config//g' build.sh
 
           # 2. DISABLE CONFIGS GLOBALLY
+          # Find any config file enabling KSU and delete the line
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU/d' {} +
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU_SUSFS/d' {} +
 
           # 3. SCRUB SOURCE CODE
+          # Remove makefile includes that might trigger "file not found" errors
           sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig || true
           sed -i '/kernelsu/d' drivers/Makefile || true
+          
+          # Remove filesystem hooks
           grep -rl "drivers/kernelsu/ksu.h" . | xargs sed -i '/drivers\/kernelsu\/ksu.h/d' || true
           grep -rl "linux/susfs.h" . | xargs sed -i '/linux\/susfs.h/d' || true
           grep -rl "ksu_handle" fs/ drivers/input/ | xargs sed -i '/ksu_handle/d' || true
           grep -rl "susfs_" fs/ include/ | xargs sed -i '/susfs_/d' || true
 
-      - name: Apply Patches
+      - name: Apply Pzqqt Patches
         run: |
-          cd workspace/device/xiaomi/marble-kernel
+          # Pzqqt patches assume a folder structure like "sm8450/drivers/..."
+          # Our kernel is at "workspace/device/xiaomi/marble-kernel"
+          # We create a symlink "sm8450" -> "marble-kernel" in the parent dir so paths match.
           
-          # LineageOS patches
-          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v || true
-          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v || true
+          cd workspace/device/xiaomi
+          ln -sf marble-kernel sm8450
+          
+          # Download and apply patches from the 'device/xiaomi' directory
+          # This allows the patch path "sm8450/drivers/..." to resolve correctly.
+          
+          # 1. LineageOS Patches
+          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v --directory=sm8450 || true
+          curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v --directory=sm8450 || true
 
-          # Pzqqt Patches
+          # 2. Pzqqt Clang Fixes (Crucial)
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply -v || true
           
-          # Clang Fixes
+          # 3. Complex Clang Fixes (Manual Sed)
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang_fix1.patch
-          sed -i 's/drivers\/staging/sm8450-modules\/qcom\/opensource\/wlan/g' clang_fix1.patch
-          patch -p1 < clang_fix1.patch || true
+          # Fix path in patch to match our structure
+          sed -i 's/sm8450-modules/sm8450-modules/g' clang_fix1.patch 
+          git apply -v clang_fix1.patch || echo "Clang Fix 1 skipped"
           
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/3e043c16430a95f6d328f5396c14ec18a52ab10a.patch > clang_fix2.patch
-          sed -i 's/drivers/sm8450\/drivers/g' clang_fix2.patch
-          sed -i 's/techpack\/display/sm8450-modules\/qcom\/opensource\/display-drivers/g' clang_fix2.patch
-          patch -p1 < clang_fix2.patch || true
+          sed -i 's/sm8450\/drivers/sm8450\/drivers/g' clang_fix2.patch
+          git apply -v clang_fix2.patch || echo "Clang Fix 2 skipped"
 
       - name: Build Kernel
         run: |
           cd workspace/device/xiaomi/marble-kernel
           chmod +x build.sh
+          # Run the build script
           ./build.sh marble
 
       - name: Package Artifacts
@@ -147,13 +169,13 @@ jobs:
           git clone --depth=1 -b marble https://github.com/bryanyee33/AnyKernel3.git .
           rm -rf .git README.md
           
-          # Copy core artifacts
+          # Copy artifacts (Checking multiple possible output locations)
           [ -f "../out/arch/arm64/boot/Image" ] && cp ../out/arch/arm64/boot/Image .
           [ -f "../Image" ] && cp ../Image .
           [ -f "../out/dtbs/dtbo.img" ] && cp ../out/dtbs/dtbo.img .
           [ -f "../dtbo.img" ] && cp ../dtbo.img .
           
-          # Copy modules
+          # Copy Modules
           [ -d "../vendor_dlkm" ] && cp -r ../vendor_dlkm/* .
           [ -d "../vendor_ramdisk" ] && cp -r ../vendor_ramdisk/* .
           
@@ -168,5 +190,4 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           files: |
-            workspace/device/xiaomi/marble-kernel/m
-            arble-kernel-stock.zip
+            workspace/device/xiaomi/marble-kernel/release_pack/marble-kernel-stock.zip
