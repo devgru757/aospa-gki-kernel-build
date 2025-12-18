@@ -66,7 +66,7 @@ jobs:
           git checkout
 
       # 7. Include personal changes (Clang fixes & Driver paths)
-      # UPDATED: Added "|| true" to ignore errors if patches are already applied
+      # UPDATED: Added Kconfig fix AND "|| true" for patches
       - name: Include personal changes
         run: |
           # Copy local config changes from your repo to the workspace
@@ -74,6 +74,11 @@ jobs:
           
           cd kernel_platform/xiaomi/sm8450
           
+          # --- FIX FOR ERROR: "can't open file drivers/kernelsu/Kconfig" ---
+          # This deletes the line in drivers/Kconfig that tries to load KernelSU
+          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig
+          # -----------------------------------------------------------------
+
           # Fix Clang 19 warnings (LineageOS patches)
           curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v || true
           curl https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v || true
