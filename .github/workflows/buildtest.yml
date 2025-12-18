@@ -1,4 +1,4 @@
-name: Build Kernel (No SU / No SUSFS)
+name: Build Kernel (Stock / No SU / No Magic Mount)
 
 on:
   workflow_dispatch:
@@ -56,7 +56,8 @@ jobs:
           
           cp ../builder_repo/manifest.xml .
           
-          # Remove SUSFS from manifest
+          # 1. PREVENT SUSFS/MAGIC MOUNT DOWNLOAD
+          # This removes the project entirely from the sync list
           sed -i '/susfs4ksu/d' manifest.xml
           
           # Initialize and Sync
@@ -65,8 +66,9 @@ jobs:
 
       - name: Setup Clang
         run: |
-          mkdir -p workspace/kernel_platform/clang
-          cd workspace/kernel_platform/clang
+          # Clone Clang to a temp folder first
+          mkdir -p workspace/temp_clang
+          cd workspace/temp_clang
           
           git clone -n --depth=1 --filter=tree:0 -b main-kernel --single-branch \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 .
@@ -77,51 +79,44 @@ jobs:
         run: |
           cp -rf builder_repo/android_kernel_xiaomi_sm8450/* workspace/kernel_platform/xiaomi/sm8450/
 
-      - name: Configure Directory Structure (The Fix)
+      - name: Restructure Directories (Fix build.sh map)
         run: |
           cd workspace
           
-          # 1. Create 'device/xiaomi' structure in the root workspace
           mkdir -p device/xiaomi
+          mkdir -p prebuilts
           
-          # 2. Symlink the Kernel Source to where build.sh expects it
-          # Expected: workspace/device/xiaomi/marble-kernel
-          # Actual:   workspace/kernel_platform/xiaomi/sm8450
-          ln -sf ../../kernel_platform/xiaomi/sm8450 device/xiaomi/marble-kernel
+          # Move Kernel Source to where build.sh expects it
+          mv kernel_platform/xiaomi/sm8450 device/xiaomi/marble-kernel
           
-          # 3. Symlink Dependencies (Modules & DT)
-          # Expected: workspace/device/xiaomi/sm8450-modules
-          ln -sf ../../kernel_platform/xiaomi/sm8450-modules device/xiaomi/sm8450-modules
-          ln -sf ../../kernel_platform/xiaomi/sm8450-devicetrees device/xiaomi/sm8450-devicetrees
+          # Move Dependencies
+          mv kernel_platform/xiaomi/sm8450-modules device/xiaomi/sm8450-modules
+          mv kernel_platform/xiaomi/sm8450-devicetrees device/xiaomi/sm8450-devicetrees
           
-          # 4. Symlink Prebuilts & Clang to root workspace
-          # build.sh calculates KP_ROOT as ../.. from the kernel dir.
-          # If kernel is at workspace/device/xiaomi/marble-kernel, then ../.. is workspace.
-          # So it looks for workspace/clang and workspace/prebuilts.
-          ln -sf kernel_platform/prebuilts prebuilts
-          ln -sf kernel_platform/clang clang
+          # Move Prebuilts & Clang
+          mv kernel_platform/prebuilts/kernel-build-tools prebuilts/
+          mv temp_clang clang
 
-      - name: Deep Clean (Remove SU & SUSFS)
+      - name: Disable SU & Magic Mount (The Safe Way)
         run: |
-          # Use the symlink path so we are consistent
           cd workspace/device/xiaomi/marble-kernel
 
-          # 1. REMOVE PERSONAL.CONFIG from build.sh
+          # 1. REMOVE PERSONAL.CONFIG from build script
+          # This file contains "CONFIG_KSU_SUSFS_SUS_MOUNT=y" (Magic Mount).
+          # Removing it from the build list disables the feature safely.
           sed -i 's/vendor\/personal.config//g' build.sh
 
-          # 2. DISABLE CONFIGS GLOBALLY
+          # 2. FORCE DISABLE FLAGS (Safety Net)
+          # We check all configs and delete any lingering enable flags.
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU/d' {} +
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU_SUSFS/d' {} +
 
-          # 3. SCRUB SOURCE CODE
+          # 3. CLEAN MAKEFILE ONLY (Fixes "Directory not found")
+          # We ONLY remove the include line for the missing folder.
+          # We DO NOT edit .c/.h files (this avoids the previous Error 2).
           sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig || true
           sed -i '/kernelsu/d' drivers/Makefile || true
           sed -i '/CONFIG_KSU/d' drivers/Makefile || true
-          
-          grep -rl "drivers/kernelsu/ksu.h" . | xargs sed -i '/drivers\/kernelsu\/ksu.h/d' || true
-          grep -rl "linux/susfs.h" . | xargs sed -i '/linux\/susfs.h/d' || true
-          grep -rl "ksu_handle" fs/ drivers/input/ | xargs sed -i '/ksu_handle/d' || true
-          grep -rl "susfs_" fs/ include/ | xargs sed -i '/susfs_/d' || true
 
       - name: Apply Patches
         run: |
@@ -146,8 +141,7 @@ jobs:
         run: |
           cd workspace/device/xiaomi/marble-kernel
           
-          # Explicitly set SRC_ROOT to the main workspace directory
-          # This ensures build.sh finds 'device/xiaomi/marble-kernel' correctly.
+          # Set SRC_ROOT to the main workspace directory
           echo "SRC_ROOT=$GITHUB_WORKSPACE/workspace" > .build.rc
           
           chmod +x build.sh
