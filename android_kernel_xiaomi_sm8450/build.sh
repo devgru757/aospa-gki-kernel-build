@@ -1,11 +1,14 @@
 #!/bin/bash
-#
-# Compile script for Xiaomi 8450 kernel, dts and modules with AOSPA
+## Compile script for Xiaomi 8450 kernel, dts and modules with AOSPA
 # Copyright (C) 2024 Adithya R.
 
 SECONDS=0 # start builtin bash timer
+
+# --- PATH SETUP FOR GITHUB ACTIONS ---
 KP_ROOT="$(realpath ../..)"
-SRC_ROOT="$HOME/pa"
+# Auto-detect SRC_ROOT as KP_ROOT (Kernel Platform) for CI builds
+SRC_ROOT="$KP_ROOT"
+
 TC_DIR="$KP_ROOT/clang/$CLANG_DIR"
 PREBUILTS_DIR="$KP_ROOT/prebuilts/kernel-build-tools/linux-x86"
 BRANCH="vauxite"
@@ -42,13 +45,9 @@ if [ -z "$TARGET" ]; then
     exit 1
 fi
 
-if ! source .build.rc || [ -z "$SRC_ROOT" ]; then
-    echo -e "Create a .build.rc file here and define\nSRC_ROOT=<path/to/aospa/source>"
-    exit 1
-fi
+# REMOVED .build.rc CHECK HERE to prevent CI failure
 
 KERNEL_DIR="$SRC_ROOT/device/xiaomi/$TARGET-kernel"
-
 if [ ! -d "$KERNEL_DIR" ]; then
     echo "$KERNEL_DIR does not exist!"
     exit 1
@@ -59,13 +58,6 @@ DTB_COPY_TO="$KERNEL_DIR/dtbs"
 DTBO_COPY_TO="$DTB_COPY_TO/dtbo.img"
 VBOOT_DIR="$KERNEL_DIR/vendor_ramdisk"
 VDLKM_DIR="$KERNEL_DIR/vendor_dlkm"
-
-# AK3_DIR="$HOME/AnyKernel3"
-# ZIPNAME="aospa-kernel-$TARGET-$(date '+%Y%m%d-%H%M').zip"
-# if test -z "$(git rev-parse --show-cdup 2>/dev/null)" &&
-#    head=$(git rev-parse --verify HEAD 2>/dev/null); then
-#     ZIPNAME="${ZIPNAME::-4}-$(echo $head | cut -c1-8).zip"
-# fi
 
 DEFCONFIG="gki_defconfig"
 DEFCONFIGS="vendor/waipio_GKI.config \
@@ -106,8 +98,9 @@ esac
 export PATH="$TC_DIR/bin:$PREBUILTS_DIR/bin:$PATH"
 
 function m() {
+    # Changed user to devgru757
     make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-        KBUILD_BUILD_USER=bryanyee33 KBUILD_BUILD_HOST=android-build \
+        KBUILD_BUILD_USER=devgru757 KBUILD_BUILD_HOST=android-build \
         DTC_EXT="$PREBUILTS_DIR/bin/dtc" \
         DTC_OVERLAY_TEST_EXT="$PREBUILTS_DIR/bin/ufdt_apply_overlay" \
         TARGET_PRODUCT=$TARGET $@ || exit $?
@@ -116,13 +109,10 @@ function m() {
 function get_trees_rev() {
     kernel_rev="$(git rev-parse HEAD | cut -c1-10)"
     [[ -n "$(git --no-optional-locks status -uno --porcelain)" ]] && kernel_rev+="+"
-
     modules_rev="$(git -C ../$MODULES_REPO rev-parse HEAD | cut -c1-8)"
     [[ -n "$(git -C ../$MODULES_REPO --no-optional-locks status -uno --porcelain)" ]] && modules_rev+="+"
-
     dt_rev="$(git -C ../$DT_REPO rev-parse HEAD | cut -c1-8)"
     [[ -n "$(git -C ../$DT_REPO --no-optional-locks status -uno --porcelain)" ]] && dt_rev+="+"
-
     echo "-${kernel_rev}-m${modules_rev}-d${dt_rev}"
 }
 
@@ -137,9 +127,11 @@ export LOCALVERSION="$(get_trees_rev)"
 echo -e "Generating config...\n"
 m $DEFCONFIG
 m ./scripts/kconfig/merge_config.sh $DEFCONFIGS vendor/${TARGET}_GKI.config
+
 scripts/config --file out/.config \
     --set-str LOCALVERSION "-$BRANCH" \
     -d LOCALVERSION_AUTO
+
 $NO_LTO && (
     scripts/config --file out/.config \
         --set-str LOCALVERSION "-${BRANCH}-nolto" \
@@ -151,19 +143,9 @@ $ONLY_CONFIG && exit
 
 echo -e "\nBuilding kernel...\n"
 m Image modules dtbs
-rm -rf out/modules out/*.ko
-m INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
+rm -rf out/modules out/*.kom INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
 
-<<no_ksu_lkm
-echo -e "\nCopying KSU LKM..."
-ksu_path="$(find $modules_out -name 'kernelsu.ko' -print -quit)"
-if [ -n "$ksu_path" ]; then
-    mv "$ksu_path" out
-    echo "Copied to out/kernelsu.ko"
-else
-    echo "Unable to locate ksu module!"
-fi
-no_ksu_lkm
+# CLEANED: Removed the "Copy KSU LKM" block completely.
 
 echo -e "\nBuilding techpack modules..."
 for module in $MODULES; do
@@ -174,30 +156,16 @@ for module in $MODULES; do
 done
 
 echo -e "\nKernel compiled succesfully!\nMerging dtb's...\n"
-
 rm -rf out/dtbs{,-base}
 mkdir out/dtbs{,-base}
 mv  out/arch/arm64/boot/dts/vendor/qcom/$DTB_WILDCARD.dtb \
     out/arch/arm64/boot/dts/vendor/qcom/$DTBO_WILDCARD.dtbo \
     out/dtbs-base
+
 rm -f out/arch/arm64/boot/dts/vendor/qcom/*.dtbo
 ../../build/android/merge_dtbs.py out/dtbs-base out/arch/arm64/boot/dts/vendor/qcom/ out/dtbs || exit $?
 
 echo -e "\nCopying files...\n"
-
-# rm -rf AnyKernel3
-# if [ -d "$AK3_DIR" ]; then
-# 	cp -r $AK3_DIR AnyKernel3
-# 	git -C AnyKernel3 checkout marble &> /dev/null
-# elif ! git clone -q https://github.com/ghostrider-reborn/AnyKernel3 -b marble; then
-# 	echo -e "\nAnyKernel3 repo not found locally and couldn't clone from GitHub! Aborting..."
-# 	exit 1
-# fi
-# KERNEL_COPY_TO="AnyKernel3"
-# DTB_COPY_TO="AnyKernel3/dtb"
-# DTBO_COPY_TO="AnyKernel3/dtbo.img"
-# VBOOT_DIR="AnyKernel3/vendor_boot_modules"
-# VDLKM_DIR="AnyKernel3/vendor_dlkm_modules"
 
 cp out/arch/arm64/boot/Image $KERNEL_COPY_TO
 echo "Copied kernel to $KERNEL_COPY_TO."
@@ -217,8 +185,8 @@ echo "Generated dtbo.img to $DTBO_COPY_TO".
 first_stage_modules="$(cat modules.list.msm.waipio)"
 second_stage_modules="$(cat modules.list.second_stage modules.list.second_stage.$TARGET)"
 vendor_dlkm_modules="$(cat modules.list.vendor_dlkm modules.list.vendor_dlkm.$TARGET)"
-modules_out="out/modules/lib/modules/$(ls -t out/modules/lib/modules/ | head -n1)"
 
+modules_out="out/modules/lib/modules/$(ls -t out/modules/lib/modules/ | head -n1)"
 rm -rf $VBOOT_DIR && mkdir -p $VBOOT_DIR
 rm -rf $VDLKM_DIR && mkdir -p $VDLKM_DIR
 
@@ -266,10 +234,4 @@ done
 sed -E -i 's|([^: ]*/)([^/]*\.ko)([:]?)([ ]\|$)|/lib/modules/\2\3\4|g' $VBOOT_DIR/modules.dep
 sed -E -i 's|([^: ]*/)([^/]*\.ko)([:]?)([ ]\|$)|/vendor_dlkm/lib/modules/\2\3\4|g' $VDLKM_DIR/modules.dep
 
-# cd AnyKernel3
-# zip -r9 "../$ZIPNAME" * -x .git README.md *placeholder
-# cd ..
-# rm -rf AnyKernel3
-
 echo -e "\nCompleted in $((SECONDS / 60)) minute(s) and $((SECONDS % 60)) second(s) !"
-# echo "$(realpath $ZIPNAME)"
