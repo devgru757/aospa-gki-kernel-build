@@ -85,84 +85,185 @@ jobs:
           cd workspace/device/xiaomi/marble-kernel
 
           # 1. REMOVE PERSONAL.CONFIG from build.sh
-          # This prevents the script from trying to merge the file that enables KSU/SUSFS
-          echo "Disabling personal.config in build script..."
+name: Build Kernel (No SU / No SUSFS)
+
+on:
+  workflow_dispatch:
+
+env:
+  CLANG_DIR: clang-r584948
+  # Optimize for CI resources
+  LTO: thin
+  # Skip ABI checks to prevent errors when removing KSU symbols
+  SKIP_ABI_CHECKS: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel-clean:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc device-tree-compiler bison flex libssl-dev git zip
+          
+          # Install Repo Tool
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+          
+          git config --global user.name "CI Builder"
+          git config --global user.email "ci@localhost"
+
+      - name: Checkout Builder Repo
+        # We need the overlay files and patches from this repo
+        uses: actions/checkout@v4
+        with:
+          path: builder_repo
+
+      - name: Initialize & Sync Source
+        run: |
+          mkdir -p workspace
+          cd workspace
+          
+          # 1. Initialize using the manifest provided in the repo
+          # This sets up the directory structure: kernel_platform/xiaomi/sm8450
+          repo init -u $GITHUB_SERVER_URL/$GITHUB_REPOSITORY -b $GITHUB_REF_NAME -m manifest.xml --depth=1
+          
+          # 2. Sync Source (Base Kernel)
+          # We use --force-sync to overwrite potential conflicts
+          repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags
+
+      - name: Setup Clang
+        run: |
+          # The build.sh script expects Clang at: ../../clang/$CLANG_DIR
+          # Relative to kernel: kernel_platform/xiaomi/sm8450 -> ../../ -> kernel_platform
+          # So we put Clang in: workspace/kernel_platform/clang
+          
+          mkdir -p workspace/kernel_platform/clang
+          cd workspace/kernel_platform/clang
+          
+          git clone -n --depth=1 --filter=tree:0 -b main-kernel --single-branch \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 .
+          git sparse-checkout set --no-cone "/$CLANG_DIR"
+          git checkout
+
+      - name: Overlay Custom Changes
+        run: |
+          # Copy the custom kernel source files from the builder repo to the synced source
+          cp -rf builder_repo/android_kernel_xiaomi_sm8450/* workspace/kernel_platform/xiaomi/sm8450/
+
+      - name: Deep Clean (Remove SU & SUSFS)
+        run: |
+          cd workspace/kernel_platform/xiaomi/sm8450
+
+          echo "Starting Deep Clean..."
+
+          # 1. REMOVE PERSONAL.CONFIG from build.sh
+          # The 'personal.config' file enables KSU. We remove it from the merge list.
           sed -i 's/vendor\/personal.config//g' build.sh
 
           # 2. DISABLE CONFIGS GLOBALLY
-          # Forcefully remove enabling flags from ALL config files
-          echo "Disabling KSU/SUSFS configs..."
+          # Forcefully delete any line enabling KSU or SUSFS in ANY config file
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU/d' {} +
           find arch/arm64/configs -type f -name "*.config" -exec sed -i '/CONFIG_KSU_SUSFS/d' {} +
 
-          # 3. SCRUB SOURCE CODE
-          echo "Scrubbing hooks from source..."
-          # Remove makefile includes
+          # 3. SCRUB BUILD FILES (Fixes "drivers/kernelsu/Kconfig: No such file")
           sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig || true
           sed -i '/kernelsu/d' drivers/Makefile || true
-          
-          # Remove filesystem hooks (KSU & SUSFS)
+          sed -i '/CONFIG_KSU/d' drivers/Makefile || true
+
+          # 4. SCRUB SOURCE HOOKS
+          # Remove C header includes and function calls to prevent linker errors
           grep -rl "drivers/kernelsu/ksu.h" . | xargs sed -i '/drivers\/kernelsu\/ksu.h/d' || true
           grep -rl "linux/susfs.h" . | xargs sed -i '/linux\/susfs.h/d' || true
           grep -rl "ksu_handle" fs/ drivers/input/ | xargs sed -i '/ksu_handle/d' || true
           grep -rl "susfs_" fs/ include/ | xargs sed -i '/susfs_/d' || true
 
-      - name: Apply Fixes & Patches
+          echo "Clean complete."
+
+      - name: Apply Patches
         run: |
-          cd workspace/device/xiaomi/marble-kernel
+          cd workspace/kernel_platform/xiaomi/sm8450
           
-          # Apply LineageOS patches (allow fail if already present)
+          # Allow patches to fail (|| true) if they are already applied in the source
+          
+          # LineageOS Patches
           curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/172b68ec702573ca1eef912e06ffdeb32f9c01ac.patch | git apply -v || true
           curl -L https://github.com/LineageOS/android_kernel_xiaomi_sm8450/commit/aea66fe46a3d796d4f85c5979678055438185cbd.patch | git apply -v || true
 
-          # Apply Pzqqt Patches (Clang Fixes)
+          # Pzqqt Patches (Clang Fixes)
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f4ae922da12b91d0b7a8109ba2851a44c61b0ba6.patch | git apply -v || true
           
-          # Custom Clang Patches (Manual application)
+          # Complex Clang Patch 1
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/f61c4b97ea8dfa65cce74c41a281dc8086e10ee6.patch > clang_fix1.patch
           sed -i 's/drivers\/staging/sm8450-modules\/qcom\/opensource\/wlan/g' clang_fix1.patch
-          patch -p1 < clang_fix1.patch || true
+          patch -p1 < clang_fix1.patch || echo "Clang Fix 1 skipped"
           
+          # Complex Clang Patch 2
           curl -L https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/3e043c16430a95f6d328f5396c14ec18a52ab10a.patch > clang_fix2.patch
           sed -i 's/drivers/sm8450\/drivers/g' clang_fix2.patch
           sed -i 's/techpack\/display/sm8450-modules\/qcom\/opensource\/display-drivers/g' clang_fix2.patch
-          patch -p1 < clang_fix2.patch || true
+          patch -p1 < clang_fix2.patch || echo "Clang Fix 2 skipped"
 
       - name: Build Kernel
         run: |
-          cd workspace/device/xiaomi/marble-kernel
+          cd workspace/kernel_platform/xiaomi/sm8450
+          
+          # Ensure .build.rc exists (Required by build.sh)
+          # SRC_ROOT = ../.. (workspace/kernel_platform)
+          echo "SRC_ROOT=$(realpath ../..)" > .build.rc
+          
           chmod +x build.sh
-          # Run the build script
           ./build.sh marble
 
       - name: Package Artifacts
         run: |
-          cd workspace/device/xiaomi/marble-kernel
+          cd workspace/kernel_platform/xiaomi/sm8450
           mkdir -p release_pack
           cd release_pack
           
           git clone --depth=1 -b marble https://github.com/bryanyee33/AnyKernel3.git .
           rm -rf .git README.md
           
-          # Copy core artifacts
+          # Copy Artifacts (Checking both standard output locations)
           [ -f "../out/arch/arm64/boot/Image" ] && cp ../out/arch/arm64/boot/Image .
           [ -f "../Image" ] && cp ../Image .
           [ -f "../out/dtbs/dtbo.img" ] && cp ../out/dtbs/dtbo.img .
           [ -f "../dtbo.img" ] && cp ../dtbo.img .
           
-          # Copy modules
+          # Copy Modules
           [ -d "../vendor_dlkm" ] && cp -r ../vendor_dlkm/* .
           [ -d "../vendor_ramdisk" ] && cp -r ../vendor_ramdisk/* .
           
-          zip -r9 "../marble-kernel-stock.zip" *
+          zip -r9 "../marble-kernel-nosu.zip" *
 
       - name: Generate Release Tag
         id: tag
-        run: echo "release_tag=Marble_Stock_$(date +'%Y.%m.%d')" >> "$GITHUB_OUTPUT"
+        run: echo "release_tag=Marble_NoSU_$(date +'%Y.%m.%d')" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           files: |
-            workspace/device/xiaomi/marble-kernel/marble-kernel-stock.zip
+            workspace/kernel_platform/xiaomi/sm8450/release_pack/marble-kernel-nosu.zip
